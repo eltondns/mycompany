@@ -1,0 +1,158 @@
+def getProjectName() {
+    return 'my-app'
+}
+
+def getMavenConfig() {
+    return 'maven-config'
+}
+
+def getMavenLocation() {
+    return 'M2_HOME'
+}
+
+def getEnvironment() {
+    return  'QA\n' +
+            'PROD'
+}
+
+def getEmailRecipients() {
+    return 'jenkins@mycompany.com'
+}
+
+// To be determined dynamically later
+def EXECUTOR_AGENT=null
+
+pipeline {
+    agent {
+        node {
+            label '' // Execute the Pipeline on an agent available in the Jenkins environment with the provided label 
+        }
+    }
+    
+    tools {
+        jdk 'Java 9'
+        maven 'Maven 3.5'
+    }
+    /**
+     * parameters directive provides a list of parameters which a user should provide when triggering the Pipeline
+     */
+    parameters {
+        choice(choices: "$environment", description: '', name: 'ENVIRONMENT')
+        string(defaultValue: "$emailRecipients",
+                description: 'List of email recipients',
+                name: 'EMAIL_RECIPIENTS')
+    }
+
+    stages {
+
+        stage ('Artifactory configuration') {
+            steps {
+                rtServer ( //hypothetical server
+                    id: "ARTIFACTORY_SERVER",
+                    url: 'http://artifactory.mycompany.com:8090/artifactory', 
+                    credentialsId: 'aoifhsd310hfas'
+                )
+
+                rtMavenDeployer (
+                    id: "MAVEN_DEPLOYER",
+                    serverId: "ARTIFACTORY_SERVER",
+                    releaseRepo: "release",
+                    snapshotRepo: "snapshot"
+                )
+
+            }
+        }
+
+        stage('Prepare') {
+            steps {
+                sh "mvn archetype:generate -DgroupId=com.mycompany.app -DartifactId=my-app -DarchetypeArtifactId=maven-archetype-quickstart -DarchetypeVersion=1.4 -DinteractiveMode=false"
+            }
+        }
+
+        stage('Maven Version') {
+            steps {
+                sh "mvn --version" 
+            }
+        }
+
+        stage('Maven Install') {
+            steps {
+                script {
+                    withMaven(globalMavenSettingsConfig: "$mavenConfig", jdk: "$JDKVersion", maven: "$mavenLocation") {
+                        try {
+                            sh "mvn clean install"
+                        } catch (Exception err) {
+                            echo 'Maven clean install failed'
+                            currentBuild.result = 'FAILURE'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Quality Analysis') {
+            steps {
+                 /**
+                 * makes use of one single agent, and spins off 2 runs of the steps inside each parallel branch
+                 */
+                parallel(
+                        "Integration Test": {
+                            echo 'Run integration tests'
+                        },
+                        "Sonar Scan": {
+                            sh "mvn sonar:sonar"
+                        }
+                )
+            }
+        }
+
+        stage('Determine Agent') {
+            steps {
+                script {
+                    if(params.ENVIRONMENT == 'PROD') {
+                        EXECUTOR_AGENT="prod-node"
+                    } else {
+                        EXECUTOR_AGENT="qa-node"
+                    }
+                }
+             }
+        }
+
+        stage('Deploy') {
+            steps {
+                node(EXECUTOR_AGENT) {
+                    dir ('my-app') 
+                    rtMavenRun (
+                        deployerId: "MAVEN_DEPLOYER",
+                        pom: 'pom.xml',
+                        goals: 'clean install test'
+                    )
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            // email template to be loaded from managed files
+            emailext body: '${SCRIPT,template="managed:EmailTemplate"}',
+                    attachLog: true,
+                    compressLog: true,
+                    mimeType: 'text/html',
+                    subject: "Pipeline Build ${BUILD_NUMBER}",
+                    to: "${params.EMAIL_RECIPIENTS}"
+
+            deleteDir()
+        }
+        
+    }
+
+    options {
+        // keep only last 10 builds
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        // timeout job after 60 minutes    
+        timeout(time: 2,
+                unit: 'MINUTES')
+    }
+
+}
